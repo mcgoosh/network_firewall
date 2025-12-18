@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Network Firewall"
+
+
+Parameters:
+  AllowedDomains:
+    Description: "comma separated list of allowed domains"
+    Type: List<String>
+    Default: ".aws.com, .a2z.com, .aws.dev, .aws.amazon.com, .amazon.com, .amazonaws.com, .awsstatic.com, .media-amazon.com, .ssl-images-amazon.com, .demdex.net, .omtrdc.net, .mktoresp.com"
+  
+  DeniedDomains:
+    Description: "comma separated list of denied domains"
+    Type: List<String>
+    Default: ".google.com, .bing.com"
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: "VPC Parameters"
+      - Label:
+          default: "EC2 Parameters"
+
+Resources:
+  FwVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.1.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: "nfw-FwVPC"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: "nfw-FwVPC-igw"
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref FwVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # NAT Gateway for Private Subnets Internet Access
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: "nfw-nat-gateway"
+
+  NatGatewayEIP2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: "nfw-nat-gateway2"
+
+  #Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.1.0/24"
+      AvailabilityZone:
+        Fn::Select: 
+          - 0
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: "nfw-public-subnet1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.2.0/24"
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: "nfw-public-subnet2"
+
+  # Private Subnets
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.3.0/24"
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: "nfw-private-subnet"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.4.0/24"
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: "nfw-private-subnet2"
+
+  #Firewall Subnets 
+  FirewallSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.16.0/28"
+      AvailabilityZone: 
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: "nfw-firewall-subnet1"
+
+  FirewallSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FwVPC
+      CidrBlock: "10.1.17.0/28"
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: "nfw-firewall-subnet2"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "nfw-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt RetrieveVpcIdLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - network-firewall:DescribeFirewall
+                Resource: "*"
+
+  RetrieveVpcIdLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: /aws/lambda/nfw-retrieve-vpceid
+        RetentionInDays: 1
+
+  FirewallVpceIds:
+    Type: Custom::DescribeVpcEndpoints
+    Properties:
+      ServiceToken: !GetAtt RetrieveVpceId.Arn
+      Az: 
+        - Fn::Select:
+            - 0
+            - Fn::GetAZs: ""
+        - Fn::Select:
+            - 1
+            - Fn::GetAZs: ""
+      FwArn: !Ref FwVPCFirewall
+
+  RetrieveVpceId:
+    Type: AWS::Lambda::Function
+    DependsOn: RetrieveVpcIdLogGroup
+    Properties:
+      FunctionName: nfw-retrieve-vpceid
+      Handler: "index.handler"
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+
+          def handler(event, context):
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+              responseData = {}
+              responseStatus = cfnresponse.FAILED
+              logger.info('Received event: {}'.format(json.dumps(event)))
+              if event["RequestType"] == "Delete":
+                  responseStatus = cfnresponse.SUCCESS
+                  cfnresponse.send(event, context, responseStatus, responseData)
+              if event["RequestType"] == "Create":
+                  try:
+                      AzList = event["ResourceProperties"]["Az"]
+                      FwArn = event["ResourceProperties"]["FwArn"]
+                  except Exception as e:
+                      logger.info('AZ retrieval failure: {}'.format(e))
+                  try:
+                      nfw = boto3.client('network-firewall')
+                  except Exception as e:
+                      logger.info('boto3.client failure: {}'.format(e))
+                  VpceIds = []
+                  try:
+                      for Az in AzList:
+                          NfwResponse=nfw.describe_firewall(FirewallArn=FwArn)
+                          VpceId = NfwResponse['FirewallStatus']['SyncStates'][Az]['Attachment']['EndpointId']
+                          VpceIds.append(VpceId)
+                  except Exception as e:
+                      logger.info('ec2.describe_firewall failure: {}'.format(e))
+
+                  responseData['FwVpceIds'] = VpceIds
+                  responseStatus = cfnresponse.SUCCESS
+                  cfnresponse.send(event, context, responseStatus, responseData)
+      Runtime: python3.12
+      Timeout: 30
+
+  FwVPCFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: "nfw-firewall"
+      FirewallPolicyArn: !Ref EgressFirewallPolicy
+      VpcId: !Ref FwVPC
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnet1
+        - SubnetId: !Ref FirewallSubnet2
+      Tags:
+        - Key: Name
+          Value: "nfw-firewall"
+
+  FwStatefulRuleGroup:
+    Type: 'AWS::NetworkFirewall::RuleGroup'
+    Properties:
+      RuleGroupName: AllowList
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+          RuleVariables:
+            IPSets:
+              HOME_NET:
+                Definition:
+                  - "10.1.0.0/16"
+          RulesSource:
+            RulesSourceList:
+              TargetTypes:
+                - HTTP_HOST
+                - TLS_SNI
+              Targets: !Ref AllowedDomains
+              GeneratedRulesType: "ALLOWLIST"
+      Description: Custom Allow Rulegroup
+      Tags:
+        - Key: Name
+          Value: "Custom-alert-nfw"
+
+  FwStatefulRuleGroup2:
+    Type: 'AWS::NetworkFirewall::RuleGroup'
+    Properties:
+      RuleGroupName: DenyList
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+          RuleVariables:
+            IPSets:
+              HOME_NET:
+                Definition:
+                  - "10.1.0.0/16"
+          RulesSource:
+            RulesSourceList:
+              TargetTypes:
+                - HTTP_HOST
+                - TLS_SNI
+              Targets: !Ref DeniedDomains
+              GeneratedRulesType: "DENYLIST"
+      Description: Custom Deny Rulegroup
+      Tags:
+        - Key: Name
+          Value: "Custom-alert-nfw"
+
+  FwStatefulRuleGroup3:
+    Type: 'AWS::NetworkFirewall::RuleGroup'
+    Properties:
+      RuleGroupName: Suricata
+      Type: STATEFUL
+      RuleGroup:
+        RulesSource:
+          #This additional rule is needed for Google QUIC traffic
+          RulesString: >
+            drop udp any any -> any 443 (msg:"Block QUIC traffic"; sid:1000001;)
+
+      Capacity: 100
+      Description: Custom Deny Rulegroup 2
+      Tags:
+        - Key: Name
+          Value: "Custom-alert-nfw"
+
+  EgressFirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: "nfw-firewall-policy"
+      FirewallPolicy:
+        StatelessDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatelessFragmentDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatefulRuleGroupReferences:
+        - ResourceArn: !Ref FwStatefulRuleGroup
+        - ResourceArn: !Ref FwStatefulRuleGroup2
+        - ResourceArn: !Ref FwStatefulRuleGroup3
+      Tags:
+        - Key: Name
+          Value: "nfw-firewall-policy"
+
+  FwVPCFirewallLogFlowGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/nfw/anfw/flow"
+
+  FwVPCFirewallLogAlertGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/nfw/anfw/alert"
+
+  FwVPCFirewallLog:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref FwVPCFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: "/nfw/anfw/flow"
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: "/nfw/anfw/alert"
+
+  PublicRtb:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-public-route-table"
+
+  PublicRtb2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-public-route-table2"
+
+  PrivateSubnetRtb:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-private-route-table"
+
+  PrivateSubnetRtb2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-private-route-table2"
+
+  PublicRtbAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRtb
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRtbAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRtb2
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateSubnetRtbAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateSubnetRtb
+      SubnetId: !Ref PrivateSubnet
+
+  PrivateSubnetRtbAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateSubnetRtb2
+      SubnetId: !Ref PrivateSubnet2
+
+  PublicRtbDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: FwVPCFirewall
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      VpcEndpointId: !Select [0, !GetAtt FirewallVpceIds.FwVpceIds]
+      RouteTableId: !Ref PublicRtb
+
+  PublicRtbDefaultRoute2:
+    Type: AWS::EC2::Route
+    DependsOn: FwVPCFirewall
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      VpcEndpointId: !Select [1, !GetAtt FirewallVpceIds.FwVpceIds]
+      RouteTableId: !Ref PublicRtb2
+
+  PrivateSubnetToNatGateway:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PrivateSubnetRtb
+
+  PrivateSubnetToNatGateway2:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway2
+      RouteTableId: !Ref PrivateSubnetRtb2
+
+  FirewallRtb:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-firewall-route-table"
+
+  FirewallRtbAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref FirewallRtb
+      SubnetId: !Ref FirewallSubnet1
+
+  FirewallRtbAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref FirewallRtb
+      SubnetId: !Ref FirewallSubnet2
+      
+  FirewallRtbDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref FirewallRtb
+
+  IngressRtb:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FwVPC
+      Tags:
+        - Key: Name
+          Value: "nfw-ingress-route-table"
+  
+  IngressRtbAssociation:
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IngressRtb
+      GatewayId: !Ref InternetGateway
+      
+  IngressRtbPublicSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: FwVPCFirewall
+    Properties:
+      DestinationCidrBlock: "10.1.1.0/24"
+      VpcEndpointId: !Select [0, !GetAtt FirewallVpceIds.FwVpceIds]
+      RouteTableId: !Ref IngressRtb
+
+  IngressRtbPublicSubnetRoute2:
+    Type: AWS::EC2::Route
+    DependsOn: FwVPCFirewall
+    Properties:
+      DestinationCidrBlock: "10.1.2.0/24"
+      VpcEndpointId: !Select [1, !GetAtt FirewallVpceIds.FwVpceIds]
+      RouteTableId: !Ref IngressRtb
+
+
+
+
